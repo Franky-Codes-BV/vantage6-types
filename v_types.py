@@ -1,4 +1,7 @@
+import json
 import pandas as pd
+import pyarrow.parquet as pq
+import warnings
 from typing import Any, Optional, List, Union, Set
 from datetime import datetime
 from pydantic import BaseModel, Field, validator, root_validator
@@ -12,6 +15,7 @@ from pandas.api.types import (
     is_object_dtype,
 )
 import logging
+import pyarrow as pa
 
 logger = logging.getLogger("vantage6.types")
 # We want to log in the jupyter notebook
@@ -97,6 +101,18 @@ class VAbstractType(BaseModel):
             attrs.append(f"description='{self.description}'")
         return f"{self.__class__.__name__}({', '.join(attrs)})"
 
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        return {
+            "type": self.__class__.__name__,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """Create a type from a dictionary"""
+        return cls(**data)
+
 
 class VNumberType(VAbstractType):
     """Base type for numerical data"""
@@ -130,6 +146,18 @@ class VNumberType(VAbstractType):
             errors.append(f"Values above maximum ({self.max} [{self.unit or '-'}])")
 
         return len(errors) == 0, errors
+
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        base_dict = super().to_dict()
+        base_dict.update(
+            {
+                "unit": self.unit,
+                "min": self.min,
+                "max": self.max,
+            }
+        )
+        return base_dict
 
 
 class VIntType(VNumberType):
@@ -203,6 +231,17 @@ class VCategoricalType(VAbstractType):
     def apply(self, series: pd.Series) -> pd.Series:
         return self.attempt_auto_conversion(series)
 
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        base_dict = super().to_dict()
+        base_dict.update(
+            {
+                "categories": self.categories,
+                "ordered": self.ordered,
+            }
+        )
+        return base_dict
+
 
 class VOrdinalType(VCategoricalType):
     """Ordinal categorical type"""
@@ -272,6 +311,17 @@ class VStringBinaryType(VBinaryType):
 
         return True, []
 
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        base_dict = super().to_dict()
+        base_dict.update(
+            {
+                "true_value": self.true_value,
+                "false_value": self.false_value,
+            }
+        )
+        return base_dict
+
 
 # ---- Text Type ----
 
@@ -322,6 +372,19 @@ class VTimestampType(VAbstractType):
     def apply(self, series: pd.Series) -> pd.Series:
         return self.attempt_auto_conversion(series)
 
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        base_dict = super().to_dict()
+        base_dict.update(
+            {
+                "min_date": str(self.min_date) if self.min_date else None,
+                "max_date": str(self.max_date) if self.max_date else None,
+                "tz": self.tz,
+                "format": self.format_,
+            }
+        )
+        return base_dict
+
 
 class VDurationType(VNumberType):
     """Duration type"""
@@ -355,6 +418,16 @@ class VDurationType(VNumberType):
 
     def apply(self, series: pd.Series) -> pd.Series:
         return self.attempt_auto_conversion(series)
+
+    def to_dict(self):
+        """Convert the type to a dictionary"""
+        base_dict = super().to_dict()
+        base_dict.update(
+            {
+                "unit": self.unit,
+            }
+        )
+        return base_dict
 
 
 class VSeries(pd.Series):
@@ -403,6 +476,12 @@ class VSeries(pd.Series):
             return True, []
         return self._v_type.validate(self)
 
+    def get_type_metadata(self):
+        """Get type metadata"""
+        if self._v_type is None:
+            return {}
+        return self._v_type.to_dict()
+
     def _get_type_info(self):
         """Get type information without causing recursion"""
         if self._v_type is None:
@@ -450,7 +529,7 @@ class VSeries(pd.Series):
             vtype_info = f"\nVType: {self._get_type_info()}"
             return original_repr + vtype_info
 
-        return original_repr
+        return original_repr + "\nVType: No VType assigned"
 
 
 class VDataFrame(pd.DataFrame):
@@ -469,3 +548,77 @@ class VDataFrame(pd.DataFrame):
         # Convert all Series to VSeries
         for col in self.columns:
             self[col] = VSeries(self[col])
+
+    def type_info(self):
+        """Get type information for the DataFrame"""
+        type_info = {col: str(self[col].v_type) for col in self.columns}
+        df = pd.DataFrame(type_info.items(), columns=["Column", "Type"]).set_index(
+            "Column"
+        )
+        df.style.set_properties(**{"text-align": "left"})
+        return df
+
+    def to_parquet(self, path, *args, **kwargs):
+        """Write DataFrame to parquet with VType metadata
+
+        Parameters
+        ----------
+        path : str
+            Path to write parquet file
+        *args, **kwargs
+            Additional arguments passed to pandas.DataFrame.to_parquet()
+        """
+        # Store VType metadata as a dictionary
+        metadata = {}
+        for col in self.columns:
+            if hasattr(self[col], "_v_type") and self[col]._v_type is not None:
+                metadata[col] = self[col].get_type_metadata()
+
+        # Convert DataFrame to PyArrow Table
+        table = pa.Table.from_pandas(self)
+
+        # Add VType metadata to the table's schema
+        if metadata:
+            # Convert metadata to bytes
+            metadata_bytes = json.dumps(metadata).encode()
+            # Create new schema with metadata
+            schema = table.schema.with_metadata({b"v_types": metadata_bytes})
+            # Create new table with updated schema
+            table = table.replace_schema_metadata(schema.metadata)
+
+        # Write the table to parquet
+        pq.write_table(table, path, *args, **kwargs)
+
+    @classmethod
+    def read_parquet(cls, path, *args, **kwargs):
+        """Read DataFrame from parquet with VType metadata
+
+        Parameters
+        ----------
+        path : str
+            Path to read parquet file
+        *args, **kwargs
+            Additional arguments passed to pandas.DataFrame.read_parquet()
+        """
+        # Read the table from parquet
+        table = pq.read_table(path, *args, **kwargs)
+
+        # Extract VType metadata from the table's schema
+        metadata = {}
+        if table.schema.metadata:
+            print(table.schema.metadata[b"v_types"])
+            print(table.schema.metadata[b"v_types"].decode())
+            metadata = json.loads(table.schema.metadata[b"v_types"].decode())
+
+        # Create a new DataFrame with VType metadata
+        df = cls(table.to_pandas())
+
+        # Add VType metadata to the DataFrame
+        for col, vtype_info in metadata.items():
+            if col in df.columns:
+                # Get the type class from the module
+                type_class = globals()[vtype_info["type"]]
+
+                # Create a new instance using from_dict
+                df[col].v_type = type_class.from_dict(vtype_info)
+        return df
