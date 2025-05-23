@@ -63,6 +63,8 @@ class VAbstractType(BaseModel):
         except Exception as e:
             return False, [str(e)]
 
+    # TODO: apply is not a good name as this is also used in pandas, rename this to
+    # convert or something similar
     def apply(self, series: pd.Series) -> pd.Series:
         """
         Attempt to convert the series to the correct dtype
@@ -445,7 +447,7 @@ class VSeries(pd.Series):
 
     def __init__(self, *args, **kwargs):
         # Initialize _v_type before super().__init__ to ensure it's set
-        self._v_type = None
+        self._v_type = VAbstractType()
         super().__init__(*args, **kwargs)
 
     @property
@@ -557,6 +559,9 @@ class VDataFrame(pd.DataFrame):
         )
         df.style.set_properties(**{"text-align": "left"})
         return df
+
+    # TODO: add method to convert to pandas dataframe
+    # TODO: add method that throws away rows that have invalid values
 
     def to_parquet(self, path, *args, **kwargs):
         """Write DataFrame to parquet with VType metadata
